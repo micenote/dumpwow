@@ -25,14 +25,8 @@
 
 #include "raii_proc.hpp"
 
-#include <hadesmem/injector.hpp>
-#include <hadesmem/region_list.hpp>
-#include <hadesmem/module.hpp>
-#include <hadesmem/read.hpp>
-#include <hadesmem/write.hpp>
-#include <hadesmem/pelib/pe_file.hpp>
-#include <hadesmem/pelib/tls_dir.hpp>
-#include <hadesmem/find_pattern.hpp>
+#include <BlackBone/Process/Process.h>
+#include <BlackBone/Patterns/PatternSearch.h>
 
 #include <Windows.h>
 #include <intrin.h>
@@ -46,6 +40,7 @@
 #include <fstream>
 #include <cstdio>
 #include <atomic>
+#include <cstdint>
 
 #pragma intrinsic(_ReturnAddress)
 
@@ -53,11 +48,7 @@
 
 namespace fs = std::experimental::filesystem;
 
-bool launch_wow_suspended(const fs::path &path,
-    PROCESS_INFORMATION &proc_info);
-hadesmem::PeFile find_wow_pe(const hadesmem::Process &process);
-void *find_tls_callback_directory(const hadesmem::Process &process,
-    const hadesmem::PeFile &pe);
+std::vector<std::uint8_t> find_wow_pe(blackbone::Process &process);
 BOOL ControlHandler(DWORD ctrl_type);
 bool FindVEHCallerRVA();
 size_t find_call_tls_initializers_rva();
@@ -86,30 +77,22 @@ int main(int argc, char *argv[])
 
     try
     {
-        PROCESS_INFORMATION proc_info;
-        if (!launch_wow_suspended(path, proc_info))
-        {
-            std::cerr << "launch_wow_suspended failed" << std::endl;
-            return EXIT_FAILURE;
-        }
-
-        g_exit_wow = false;
-      
-        const hadesmem::Process process(proc_info.dwProcessId);
+        blackbone::Process wow;
+        wow.CreateAndAttach(path, true);
 
         // ensure process is killed upon exit
-        const RaiiProc proc_killer(process.GetId());
+        const RaiiProc proc_killer(wow.pid());
 
-        auto const pe_file = find_wow_pe(process);
+        auto pe_file_buff = find_wow_pe(wow);
 
-        std::cout << "Wow base address:       0x" << std::hex
-            << reinterpret_cast<std::uintptr_t>(pe_file.GetBase())
-            << std::endl;
+        blackbone::pe::PEImage pe;
+        pe.Load(&pe_file_buff[0], pe_file_buff.size(), false);
 
         // temporarily disable TLS callbacks to prevent them from executing
         // when we inject
-        auto const tls_callback_directory = 
+/*        auto const tls_callback_directory =
             find_tls_callback_directory(process, pe_file);
+
 
         if (!tls_callback_directory)
         {
@@ -155,19 +138,14 @@ int main(int argc, char *argv[])
         // restore first TLS callback
         hadesmem::Write<void *>(process, tls_callback_directory,
             first_callback);
-
+            */
         if (!::SetConsoleCtrlHandler(ControlHandler, TRUE))
         {
             std::cerr << "SetConsoleCtrlHandler failed" << std::endl;
             return EXIT_FAILURE;
         }
 
-        CONTEXT context;
-        memset(&context, 0, sizeof(context));
-        context.ContextFlags = CONTEXT_ALL;
-        ::GetThreadContext(proc_info.hThread, &context);
-
-        if (!::ResumeThread(proc_info.hThread))
+        if (wow.Resume() != STATUS_SUCCESS)
         {
             std::cerr << "Failed to resume main thread" << std::endl;
             return EXIT_FAILURE;
@@ -179,13 +157,17 @@ int main(int argc, char *argv[])
         {
             if (g_exit_wow)
             {
+                g_exit_wow = false;
                 std::cout << "Received CTRL-C.  Terminating wow..."
                     << std::endl;
-                ::TerminateProcess(process.GetHandle(), 0);
-                g_exit_wow = false;
+                if (wow.Terminate(0) != STATUS_SUCCESS)
+                {
+                    std::cerr << "TerminateProcess failed" << std::endl;
+                    return EXIT_FAILURE;
+                }
             }
 
-            if (!::GetExitCodeProcess(proc_info.hProcess, &exit_code))
+            if (!::GetExitCodeProcess(wow.core().handle(), &exit_code))
             {
                 std::cerr << "GetExitCodeProcess failed" << std::endl;
                 return EXIT_FAILURE;
@@ -197,7 +179,7 @@ int main(int argc, char *argv[])
 
             // if STILL_ACTIVE is the exit code, the process may have chosen to
             // exit using that error code, so try one more check
-            if (::WaitForSingleObject(proc_info.hProcess, 0) != WAIT_TIMEOUT)
+            if (::WaitForSingleObject(wow.core().handle(), 0) != WAIT_TIMEOUT)
                 break;
 
             // if the waiting timed out, it means the process is still running.
@@ -218,8 +200,7 @@ int main(int argc, char *argv[])
     }
     catch (const std::exception &e)
     {
-        std::cerr << "Error:\n" << boost::diagnostic_information(e)
-            << std::endl;
+        std::cerr << "Error: " << e.what() << std::endl;
         process_log_file(path);
         return EXIT_FAILURE;
     }
@@ -263,76 +244,43 @@ bool FindVEHCallerRVA()
     return *call_site == 0xFF && *(call_site + 5) == 0;
 }
 
-bool launch_wow_suspended(const fs::path &path,
-    PROCESS_INFORMATION &proc_info)
+std::vector<std::uint8_t> find_wow_pe(blackbone::Process &process)
 {
-    // launch wow in a suspended state
-    STARTUPINFO start_info {};
-    start_info.cb = static_cast<DWORD>(sizeof(start_info));
-    memset(&proc_info, 0, sizeof(proc_info));
-
-    return !!::CreateProcessW(path.wstring().c_str(), nullptr, nullptr,
-        nullptr, FALSE, CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
-        nullptr, nullptr, &start_info, &proc_info);
-}
-
-hadesmem::PeFile find_wow_pe(const hadesmem::Process &process)
-{
-    const hadesmem::RegionList region_list(process);
+    auto &wow_memory = process.memory();
+    auto const regions = wow_memory.EnumRegions();
 
     // find the PE header for wow
-    for (auto const &region : region_list)
+    for (auto const &region : regions)
     {
-        if (region.GetState() == MEM_FREE)
+        if (region.Type != MEM_IMAGE)
             continue;
 
-        if (region.GetType() != MEM_IMAGE)
+        if (region.Protect != PAGE_READONLY)
             continue;
 
-        if (region.GetProtect() != PAGE_READONLY)
+        if (region.AllocationBase != region.BaseAddress)
             continue;
 
-        if (region.GetAllocBase() != region.GetBase())
+        std::vector<std::uint8_t> pe_data(region.RegionSize);
+        if (wow_memory.Read(region.BaseAddress, pe_data.size(), &pe_data[0]) !=
+            STATUS_SUCCESS)
             continue;
 
-        hadesmem::PeFile pe_file(process, region.GetBase(),
-            hadesmem::PeFileType::kImage,
-            static_cast<DWORD>(region.GetSize()));
+        blackbone::pe::PEImage pe;
+        pe.Load(&pe_data[0], pe_data.size(), false);
 
-        std::vector<ULONGLONG> callbacks;
+        auto const tls_dir = pe.DirectoryAddress(IMAGE_DIRECTORY_ENTRY_TLS);
 
-        try
-        {
-            const hadesmem::TlsDir tls_dir(process, pe_file);
-            tls_dir.GetCallbacks(std::back_inserter(callbacks));
-        }
-        catch (const hadesmem::Error &)
-        {
-            continue;
-        }
-
-        // wow has tls callbacks
-        if (callbacks.empty())
+        if (!tls_dir)
             continue;
 
-        return std::move(pe_file);
+        std::cout << "Wow base address:       0x" << std::hex
+            << region.BaseAddress << std::endl;
+
+        return std::move(pe_data);
     }
 
     throw std::runtime_error("Could not find wow PE");
-}
-
-void *find_tls_callback_directory(const hadesmem::Process &process,
-    const hadesmem::PeFile &pe)
-{
-    try
-    {
-        const hadesmem::TlsDir tls_dir(process, pe);
-        return reinterpret_cast<void *>(tls_dir.GetAddressOfCallBacks());
-    }
-    catch (const hadesmem::Error &)
-    {
-        return nullptr;
-    }
 }
 
 size_t find_call_tls_initializers_rva()
@@ -342,43 +290,46 @@ size_t find_call_tls_initializers_rva()
     if (!ntdll)
         return 0;
 
-    const hadesmem::Process process(::GetCurrentProcessId());
+    blackbone::Process process;
+    process.Attach(::GetCurrentProcess());
 
     // find "LdrpCallTlsInitializers"
-    auto const magic_value = hadesmem::Find(process, L"ntdll.dll",
-        L"4C 64 72 70 43 61 6C 6C 54 6C 73 49 "
-         "6E 69 74 69 61 6C 69 7A 65 72 73 00",
-        hadesmem::PatternFlags::kScanData,
-        0);
+    blackbone::PatternSearch first_pattern(
+        "\x4C\x64\x72\x70\x43\x61\x6C\x6C\x54\x6C\x73\x49"
+        "\x6E\x69\x74\x69\x61\x6C\x69\x7A\x65\x72\x73\x00");
 
-    if (!magic_value)
+    std::vector<blackbone::ptr_t> out;
+    first_pattern.Search(ntdll, 0xFFFFFF, out);
+
+    if (out.empty())
         return 0;
+
+    auto p_LdrpCallTlsInitializers = reinterpret_cast<void*>(out[0]);
 
     const std::uint8_t *magic_value_ref = nullptr;
 
+    blackbone::PatternSearch deref_pattern("\x4C\x8D\x05???\x00");
+
     // find recurrences of the byte pattern which dereferences the magic value
     // and check for one that actually is dereferencing it
-    for (auto p = hadesmem::Find(process, L"ntdll.dll",
-        L"4c 8d 05 ?? ?? ?? 00", 0, 0); p;)
+    deref_pattern.Search(p_LdrpCallTlsInitializers, 0xFFFF, out);
+
+    for (auto const &p : out)
     {
-        auto const p_offset = reinterpret_cast<std::uint8_t *>(p) -
-            reinterpret_cast<std::uint8_t *>(ntdll);
+        auto const p_offset = reinterpret_cast<std::uintptr_t *>(p) -
+            reinterpret_cast<std::uintptr_t *>(ntdll);
 
         auto const expected_offset = static_cast<std::uint32_t>(
-            reinterpret_cast<std::uintptr_t>(magic_value) -
-            reinterpret_cast<std::uintptr_t>(p)) - 7;
+            reinterpret_cast<std::uintptr_t>(p_LdrpCallTlsInitializers) - p)
+            - 7;
 
-        auto const offset = hadesmem::Read<std::uint32_t>(process,
-            reinterpret_cast<unsigned char *>(p) + 3);
+        auto const offset = *reinterpret_cast<std::uint32_t*>(p + 3);
 
         if (offset == expected_offset)
         {
             magic_value_ref = reinterpret_cast<const std::uint8_t *>(p);
             break;
         }
-
-        p = hadesmem::Find(process, L"ntdll.dll", L"4c 8d 05 ?? ?? ?? 00", 0,
-            p_offset);
     }
 
     // not found?  give up
@@ -394,7 +345,7 @@ size_t find_call_tls_initializers_rva()
         auto const p = reinterpret_cast<const std::uint8_t *>(magic_value_ref)
             - offset;
 
-        if (*p != 0xCC &&
+        if (*(p - 0) != 0xCC &&
             *(p - 1) == 0xCC &&
             *(p - 2) == 0xCC &&
             *(p - 3) == 0xCC &&
